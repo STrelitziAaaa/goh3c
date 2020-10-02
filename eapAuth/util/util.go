@@ -1,6 +1,7 @@
 package util
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -11,22 +12,20 @@ import (
 )
 
 var Debug bool
+var Info bool
 
 func init() {
 	Debug = false
+	Info = true
 }
 
-// func WriteAll(fd int, addr syscall.Sockaddr, data ...[]byte) (err error) {
-// 	buf := bytes.NewBuffer(nil)
-// 	for _, v := range data {
-// 		buf.Write(v)
-// 	}
-// 	err = syscall.Sendto(fd, buf.Bytes(), 0, addr)
-// 	if err != nil {
-// 		return err
-// 	}
-// 	return nil
-// }
+func BufferAll(data ...[]byte) []byte {
+	buf := bytes.NewBuffer(nil)
+	for _, v := range data {
+		buf.Write(v)
+	}
+	return buf.Bytes()
+}
 
 func CopyAll(dst []byte, src ...[]byte) int {
 	n_written := 0
@@ -57,11 +56,15 @@ func BufferWriteAll(w io.Writer, data ...interface{}) error {
 }
 
 func LogInfoln(info interface{}) {
-	log.Println("[INFO]", info)
+	if Info {
+		log.Println("[INFO]", info)
+	}
 }
 
 func LogInfof(fmt string, v ...interface{}) {
-	log.Printf("[INFO] "+fmt, v...)
+	if Info {
+		log.Printf("[INFO] "+fmt, v...)
+	}
 }
 
 func LogDebugln(info interface{}) {

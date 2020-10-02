@@ -2,8 +2,6 @@ package eapAuth
 
 import (
 	"fmt"
-	"strconv"
-	"strings"
 
 	// "log"
 	"errors"
@@ -30,32 +28,6 @@ func winShowDeviceByNet() {
 }
 
 // get input to choose interface
-func utilInputDevice(show bool) *pcap.Interface {
-	// winShowDeviceByNet()
-	ifs, err := pcap.FindAllDevs()
-	handleErr(err)
-	if show {
-		for _, if_ := range ifs {
-			fmt.Printf("Name:%s , Desciption:%s\n", if_.Name, if_.Description)
-		}
-	}
-	fmt.Println("请输入网卡序号(从0开始):")
-	var ifi int
-	fmt.Scanf("%d\n", &ifi)
-
-	return &ifs[ifi]
-}
-
-func utilInputUser() (usr string, psw string) {
-	var err error
-	fmt.Println("请输入用户名:")
-	_, err = fmt.Scanf("%s\n", &usr)
-	handleErr(err)
-	fmt.Println("请输入密码:")
-	_, err = fmt.Scanf("%s\n", &psw)
-	handleErr(err)
-	return
-}
 
 func utilFindDeviceIpv4(device pcap.Interface) string {
 	for _, addr := range device.Addresses {
@@ -89,16 +61,4 @@ func utilFindMacAddrByIp(ip string) (string, error) {
 		}
 	}
 	return "", errors.New(fmt.Sprintf("no device has given ip: %s", ip))
-}
-
-func utilProcessRawHardwareAddr(addr string) (addr_ret HardwareAddr) {
-	addr = strings.ReplaceAll(addr, "-", "")
-	// fmt.Println(addr)
-	for i := 0; i < 12; i += 2 {
-		uint8_, _ := strconv.ParseUint(addr[i:i+2], 16, 8)
-		// fmt.Printf("->%s %d\n", addr[i:i+2], uint8_)
-		addr_ret = append(addr_ret, byte(uint8_))
-	}
-	// fmt.Printf("0x%x\n", []byte(addr_ret))
-	return
 }

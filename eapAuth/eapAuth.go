@@ -7,6 +7,8 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	// "os"
+	"sync"
 
 	// "strconv"
 	// "strings"
@@ -91,7 +93,8 @@ type Client struct {
 
 	ethHdr []byte // 备用
 
-	Handle *pcap.Handle
+	Handle       *pcap.Handle
+	heartBeatPkt []byte // cache
 }
 
 func (c *Client) sendAll(data ...[]byte) {
@@ -181,8 +184,9 @@ func getEtherPayload(type_ uint8) (payload []byte) {
 }
 
 type eapConfig interface {
-	GetDevice() (*pcap.Interface, bool)
-	GetUser() (string, string, bool)
+	GetDevice() *pcap.Interface
+	GetUser() (string, string)
+	GetHardwareAddr() HardwareAddr
 }
 
 func NewNilClient() *Client {
@@ -190,38 +194,23 @@ func NewNilClient() *Client {
 }
 
 func NewClient(config eapConfig) *Client {
-	device := (*pcap.Interface)(nil)
-	username := ""
-	password := ""
-	var ok bool
-
 	if config == nil {
-		username, password = utilInputUser()
-		device = utilInputDevice(true)
-	} else {
-		if username, password, ok = config.GetUser(); !ok {
-			username, password = utilInputUser()
-		}
-		if device, ok = config.GetDevice(); !ok {
-			device = utilInputDevice(true)
-		}
+		return NewNilClient()
 	}
 
-	fmt.Printf("你选择了 %s\n", device.Description)
+	device := config.GetDevice()
+	username, password := config.GetUser()
 
-	handle, err := pcap.OpenLive(device.Name, 1564 /*每个数据包读取的最大值*/, false /*是否开启混杂模式*/, 30*time.Second /*读包超时时长*/)
+	handle, err := pcap.OpenLive(device.Name, 100 /*每个数据包读取的最大值*/, true /*是否开启混杂模式*/, 30*time.Second /*读包超时时长*/)
 	handleErr(err)
 
 	fd := newCustomeSocket(nil)
 	// hardwareAddr, err := HardwareAddr("\x00\x0E\xC6\xD7\x40\x50"), nil
 	// \Device\NPF_{2472EB93-D9EB-4E08-8F3A-249B764038F9}
-	fmt.Println("请输入网卡地址:(形如C1-B2-F3-84-B5-C6)")
-	var rawAddr string
-	fmt.Scanf("%s\n", &rawAddr)
-	hardwareAddr := utilProcessRawHardwareAddr(rawAddr)
-	handleErr(err)
+	hardwareAddr := config.GetHardwareAddr()
+
 	util.LogInfof("fd:%d , device:%s , MAC:%s , username:%s\n", fd, device.Description, hardwareAddr.String(), username)
-	return &Client{fd, device, username, password, hardwareAddr, nil, nil, handle}
+	return &Client{fd, device, username, password, hardwareAddr, nil, nil, handle, nil}
 }
 
 func (c *Client) Close() {
@@ -232,11 +221,10 @@ var TestTargetMac = [6]byte{0xC0, 0xB6, 0xF9, 0x8B, 0xB2, 0xC1}
 
 // EAP over lan start,客户端向设备触发802.1X验证
 func (c *Client) eapStart() {
-	// 在win上用wireshark抓wsl网卡,可以正常抓到,难道是要padding?
 	c.ethHdr = getEtherHdr(paeMulticastAddr1, []byte(c.MyHardwareAddr), uint16(0x888e))
 	// ethPayload := getEtherPayload(EAPOL_LOGIN)
 	ethPayload := getEAPoL(EAPOL_START, nil)
-	util.LogInfof("Ethernet Frame Headr: 0x%x , Payload: 0x%x\n", c.ethHdr, ethPayload)
+	util.LogDebugf("Ethernet Frame Headr: 0x%x , Payload: 0x%x\n", c.ethHdr, ethPayload)
 	c.sendAll(c.ethHdr, ethPayload)
 	util.LogInfoln("[EAPoL] Start")
 }
@@ -255,7 +243,7 @@ func (c *Client) HandleEther(pkt []byte) (payload interface{}, err error) {
 	}
 
 	uplayerType := binary.BigEndian.Uint16(pkt[12:])
-	util.LogInfof("[ETHERNET] dst:0x%x src:0x%x type:0x%x", dst, src, uplayerType)
+	util.LogDebugf("[ETHERNET] dst:0x%x src:0x%x type:0x%x", dst, src, uplayerType)
 	// myMac := []byte(c.MyHardwareAddr)
 	// if !util.CompareMac(dst, myMac) {
 	// 	err = fmt.Errorf("handleEther: Unmatched dst: expected:0x%x , got:0x%x", myMac, dst)
@@ -275,7 +263,7 @@ func (c *Client) HandleEther(pkt []byte) (payload interface{}, err error) {
 	// 	}
 	// 	return
 	// }
-	util.LogInfof("[LUCKY] matched Type: 0x%x 802.1X Auth", uplayerType)
+	util.LogDebugf("[LUCKY] matched Type: 0x%x 802.1X Auth", uplayerType)
 	return
 }
 
@@ -316,15 +304,16 @@ func (c *Client) HandleEAP(pkt []byte) (payload interface{}, err error) {
 	switch hdr.Code {
 	case EAP_CODE_SUCCESS:
 		util.LogInfoln("[SUCCESS] Auth Passed")
-		util.LogInfoln("[Waiting] Dhcp Discover")
+		util.LogInfoln("Now we have to wait for Dhcp , and change to daemon")
 		// Now we need dhcp
 		// for win , it will send dhcp automatically
-		// Now we need change process to daemon
+		// Now we need to change process to daemon
+		daemon("./log")
+
 	case EAP_CODE_FAILURE:
-		util.LogInfoln("[FAIL] EAP FAILURE")
+		util.LogWarnf("[FAIL] EAP FAILURE")
 		syscall.Exit(-1)
 	case EAP_CODE_REQUEST:
-		util.LogInfoln("[RECV] EAP_CODE_REQUEST")
 		reqType := int(payload.([]byte)[0])
 		payload = payload.([]byte)[1:]
 		switch reqType {
@@ -333,11 +322,18 @@ func (c *Client) HandleEAP(pkt []byte) (payload interface{}, err error) {
 			// used in the auth and heartbeat
 
 			// first change ether header
-			util.LogInfoln("---- EAP_TYPE_ID")
+			util.LogInfoln("[RECV] EAP_CODE_REQUEST  ---- EAP_TYPE_ID")
+			// if c.heartBeatPkt != nil {
+			// 	c.sendAll(c.heartBeatPkt)
+			// 	util.LogInfoln("[RESP] OK")
+			// 	break
+			// }
 			pld := bytes.NewBuffer(nil)
 			handleErr(util.BufferWriteAll(pld, []byte(VERSION_INFO), []byte(c.userName)))
-			c.sendAll(c.ethHdr, getEAPoL(EAPOL_EAPPACKET, getEAP(EAP_CODE_RESPONSE, hdr.Id, EAP_TYPE_ID, pld.Bytes())))
-			util.LogInfoln("---- SEND OK")
+			idPkt := util.BufferAll(c.ethHdr, getEAPoL(EAPOL_EAPPACKET, getEAP(EAP_CODE_RESPONSE, hdr.Id, EAP_TYPE_ID, pld.Bytes())))
+			c.heartBeatPkt = idPkt
+			c.sendAll(idPkt)
+			util.LogInfoln("[RESP] OK")
 
 		// this is not used in windows
 		// case EAP_TYPE_PSW:
@@ -350,7 +346,7 @@ func (c *Client) HandleEAP(pkt []byte) (payload interface{}, err error) {
 		// 	break
 
 		case EAP_TYPE_MD5:
-			util.LogInfoln("---- EAP_TYPE_MD5")
+			util.LogInfoln("[RECV] EAP_CODE_REQUEST  ---- EAP_TYPE_MD5")
 			len_ := payload.([]byte)[0] // len=16,后面有16字节的md5_data,作为密钥加密
 			key := payload.([]byte)[1 : len_+1]
 			var chap []byte
@@ -367,18 +363,17 @@ func (c *Client) HandleEAP(pkt []byte) (payload interface{}, err error) {
 			err := util.BufferWriteAll(pld, uint8(len(chap)), chap, []byte(c.userName))
 			handleErr(err)
 			c.sendAll(c.ethHdr, getEAPoL(EAPOL_EAPPACKET, getEAP(EAP_CODE_RESPONSE, hdr.Id, EAP_TYPE_MD5, pld.Bytes())))
-			util.LogInfoln("---- SEND OK")
+			util.LogInfoln("[RESP] OK")
 		}
 	case EAP_CODE_RESPONSE:
-		util.LogInfoln("---- EAP_CODE_RESPONSE")
+		util.LogInfoln("[RECV] EAP_CODE_RESPONSE")
 		// we cant recv response, we just recv request and send response
 		util.LogInfoln("[Warning]: Receive Response EAP")
 	case EAP_CODE_UNKNOWN:
-		util.LogInfoln("---- EAP_CODE_UNKNOWN")
+		util.LogInfoln("[RECV] EAP_CODE_UNKNOWN")
 		// do nothin
 		util.LogWarnf("Received Unknown EAP")
 	}
-
 	return
 }
 
@@ -394,25 +389,35 @@ func getEAP(code uint8, id uint8, t uint8, payload []byte) []byte {
 	buf := bytes.NewBuffer(nil)
 	err := util.BufferWriteAll(buf, code, id, uint16(len(payload)+5), t, payload)
 	handleErr(err)
-	fmt.Printf("getEAP header: 0x%x\n", buf.Bytes()[:5])
-	fmt.Printf("getEAP payload: 0x%x\n", buf.Bytes()[5:])
+	util.LogDebugf("getEAP header: 0x%x\n", buf.Bytes()[:5])
+	util.LogDebugf("getEAP payload: 0x%x\n", buf.Bytes()[5:])
 	return buf.Bytes()
 }
 
-func (c *Client) Start() {
+// it will serve forever
+func (c *Client) StartAndServe() {
 	p := NewPktParser()
 	p.AddHandleFunc(c.HandleEther).AddHandleFunc(c.HandleEAPoL).AddHandleFunc(c.HandleEAP)
 	var filter string = "ether dst " + c.MyHardwareAddr.String() + " && ether proto 0x888e"
 	handleErr(c.Handle.SetBPFFilter(filter))
 
 	pktSrc := gopacket.NewPacketSource(c.Handle, c.Handle.LinkType())
-	c.eapStart()
-	for {
-		util.LogInfoln("[WAIT] ready to recv")
-		for v := range pktSrc.Packets() {
-			p.Handle(v.Data())
+	pktSrc.NoCopy = true
+
+	wg := sync.WaitGroup{}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			util.LogInfoln("[WAIT] ready to recv")
+			for v := range pktSrc.Packets() {
+				p.Handle(v.Data())
+			}
 		}
-	}
+	}()
+	time.Sleep(time.Second * 5)
+	c.eapStart()
+	wg.Wait()
 }
 
 // func (c *Client) Test() {
@@ -455,4 +460,19 @@ func SetDebug(debug bool) {
 	Debug = debug
 	util.Debug = debug
 	util.LogInfof("[DEBUG] Set OK : %v", debug)
+}
+
+// error
+func daemon(logPath string) {
+
+	// p, err := syscall.GetCurrentProcess()
+	// handleErr(err)
+	// fd, err := syscall.Open(logPath, os.O_CREATE|os.O_RDWR, 0777)
+	// handleErr(err)
+	// handleErr(syscall.DuplicateHandle(p, syscall.Stderr, p, &fd, 0, true, syscall.DUPLICATE_SAME_ACCESS))
+	// handleErr(syscall.DuplicateHandle(p, syscall.Stdout, p, &fd, 0, true, syscall.DUPLICATE_SAME_ACCESS))
+	// handleErr(syscall.CloseHandle(syscall.Stderr))
+	// handleErr(syscall.CloseHandle(syscall.Stdin))
+	// handleErr(syscall.CloseHandle(syscall.Stdout))
+	// util.Info = false
 }
