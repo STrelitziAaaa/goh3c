@@ -8,7 +8,9 @@ import (
 	"encoding/json"
 	"flag"
 	"io/ioutil"
+	"net"
 	"os"
+	"os/exec"
 	"strconv"
 	"strings"
 	"syscall"
@@ -21,7 +23,8 @@ import (
 	"fmt"
 )
 
-var debug = flag.Bool("debug", false, "a bool")
+var isDebug = flag.Bool("debug", false, "a bool")
+var isDaemon = flag.Bool("daemon", false, "daemon")
 
 type user struct {
 	Username     string
@@ -35,7 +38,8 @@ func NewUser(conf string) user {
 	if _, err := os.Stat(conf); err != nil {
 		name, psw := utilInputUser()
 		device := utilInputDevice(true)
-		addr := utilInputAddr()
+		addr := utilGetAddr(device)
+		// addr := utilInputAddr()
 		u := user{name, psw, device, addr}
 		handleErr(u.MarshallWrite(conf))
 		return u
@@ -109,6 +113,35 @@ func utilInputDevice(show bool) *pcap.Interface {
 	return &ifs[ifi]
 }
 
+func utilGetAddr(ifi *pcap.Interface) []byte {
+	for _, v := range ifi.Addresses {
+		ip := v.IP.String()
+		fmt.Println(ip)
+		hAddr := findHardwareAddrByip(ip)
+		if hAddr != nil {
+			fmt.Println(net.HardwareAddr(hAddr).String())
+			return hAddr
+		}
+	}
+	// 如果都找不到,可以试试: getmac这个cmd命令,cmd = "getmac | grep ifi.Name > ./tmp" ,再读取文件
+	return nil
+}
+
+func findHardwareAddrByip(ip string) []byte {
+	ifs, err := net.Interfaces()
+	handleErr(err)
+	for _, v := range ifs {
+		addrs, err := v.Addrs()
+		handleErr(err)
+		for _, vv := range addrs {
+			if strings.Split(vv.String(), "/")[0] == ip {
+				return v.HardwareAddr
+			}
+		}
+	}
+	return nil
+}
+
 func utilInputUser() (usr string, psw string) {
 	var err error
 	fmt.Println("请输入用户名:")
@@ -142,9 +175,31 @@ func utilProcessRawHardwareAddr(addr string) (addr_ret eapAuth.HardwareAddr) {
 
 func main() {
 	flag.Parse()
-	eapAuth.SetDebug(*debug)
+	eapAuth.SetDaemon(*isDaemon)
+	eapAuth.SetDebug(*isDebug)
 	user := NewUser("./user.conf")
 	c := eapAuth.NewClient(user)
-	c.StartAndServe()
+	if *isDaemon {
+		fmt.Println("in daemon: i will serve 4ever")
+		handleErr(syscall.FlushFileBuffers(syscall.Stdout))
+		c.StartAuth()
+		return
+	}
+	if ok := c.StartAuth(); ok {
+		f, err := os.OpenFile("log", os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0777)
+		handleErr(err)
+		// change to daemon
+		cmd := exec.Cmd{
+			Path:   os.Args[0],
+			Args:   os.Args,
+			Env:    os.Environ(),
+			Stdout: f,
+			Stderr: f,
+		}
+		cmd.Args = append(cmd.Args, "-daemon")
+		cmd.Start()
+	} else {
+		fmt.Println("Auth Failed")
+	}
 	c.Close()
 }

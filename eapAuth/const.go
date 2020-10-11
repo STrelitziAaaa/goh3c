@@ -31,9 +31,12 @@ const (
 )
 
 var (
-	Debug bool
+	Debug    bool
+	isDaemon bool
 )
+
 
 func init() {
 	Debug = false
+	isDaemon = false
 }
